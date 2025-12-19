@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Wedding playlist reviewer
+Wedding playlist reviewer with ML-assisted progressive filtering
 
 Usage:
-  python review_playlist.py wedding_dance_playlist.csv
+  python main.py [dataset.csv]
 
 What it does:
-- Walks through songs one-by-one
-- You pick: keep / skip / maybe / back / quit
+- Genre category selection to exclude unwanted categories
+- Review songs in batches of 15 with 1-4 ratings
+- ML model learns preferences and filters to top 50% after each batch
+- Goal: Find 60 songs rated 4 (love it)
 - Saves progress so you can resume later
-- Exports kept/maybe lists to CSV at the end
+- Exports songs by rating to CSV files
 """
 
 from __future__ import annotations
@@ -19,14 +21,13 @@ import csv
 import json
 import os
 import pickle
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 try:
     import numpy as np
     from sklearn.ensemble import RandomForestClassifier
-    from sklearn.preprocessing import LabelEncoder, StandardScaler
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
@@ -156,8 +157,129 @@ class SongRow:
         return result
 
 
-def safe_stem(path: Path) -> str:
-    return path.name.replace(".", "_")
+def get_genre_category(genre: str) -> str:
+    """Map individual genres to broader categories."""
+    genre_lower = genre.lower()
+    
+    # Pop
+    if genre_lower in {'pop', 'pop-film', 'power-pop', 'synth-pop', 'indie-pop'}:
+        return 'Pop'
+    
+    # Rock
+    if genre_lower in {'rock', 'alt-rock', 'alternative', 'hard-rock', 'rock-n-roll', 'rockabilly', 'psych-rock'}:
+        return 'Rock'
+    
+    # Metal
+    if genre_lower in {'metal', 'black-metal', 'death-metal', 'heavy-metal', 'metalcore', 'grindcore'}:
+        return 'Metal'
+    
+    # Punk
+    if genre_lower in {'punk', 'punk-rock', 'emo'}:
+        return 'Punk'
+    
+    # Hip-Hop & R&B
+    if genre_lower in {'hip-hop', 'r-n-b', 'rap'}:
+        return 'Hip-Hop & R&B'
+    
+    # Electronic & Dance
+    if genre_lower in {'edm', 'electronic', 'electro', 'dance', 'house', 'deep-house', 'progressive-house', 
+                       'techno', 'minimal-techno', 'detroit-techno', 'chicago-house', 'trance', 
+                       'dubstep', 'drum-and-bass', 'breakbeat', 'garage', 'hardstyle', 'hardcore', 
+                       'idm', 'club'}:
+        return 'Electronic & Dance'
+    
+    # Indie
+    if genre_lower in {'indie', 'british'}:
+        return 'Indie'
+    
+    # Country
+    if genre_lower in {'country', 'honky-tonk', 'bluegrass'}:
+        return 'Country'
+    
+    # Jazz
+    if genre_lower == 'jazz':
+        return 'Jazz'
+    
+    # Blues
+    if genre_lower == 'blues':
+        return 'Blues'
+    
+    # Folk
+    if genre_lower in {'folk', 'singer-songwriter', 'songwriter'}:
+        return 'Folk'
+    
+    # Classical
+    if genre_lower in {'classical', 'opera', 'piano'}:
+        return 'Classical'
+    
+    # Latin
+    if genre_lower in {'latin', 'latino', 'salsa', 'samba', 'reggaeton', 'brazil', 'forro', 
+                       'sertanejo', 'pagode', 'tango', 'mpb'}:
+        return 'Latin'
+    
+    # International/World
+    if genre_lower in {'world-music', 'indian', 'iranian', 'turkish', 'swedish', 'french', 'german', 
+                       'spanish', 'malay'}:
+        return 'International'
+    
+    # K-Pop & J-Pop
+    if genre_lower in {'k-pop', 'j-pop', 'j-rock', 'j-dance', 'j-idol', 'anime', 'cantopop', 'mandopop'}:
+        return 'K-Pop & J-Pop'
+    
+    # Reggae
+    if genre_lower in {'reggae', 'dancehall', 'dub'}:
+        return 'Reggae'
+    
+    # Funk & Soul
+    if genre_lower in {'funk', 'soul', 'groove'}:
+        return 'Funk & Soul'
+    
+    # Gospel
+    if genre_lower == 'gospel':
+        return 'Gospel'
+    
+    # Disco
+    if genre_lower == 'disco':
+        return 'Disco'
+    
+    # Ambient & Chill
+    if genre_lower in {'ambient', 'chill', 'sleep', 'study', 'new-age'}:
+        return 'Ambient & Chill'
+    
+    # Acoustic
+    if genre_lower in {'acoustic', 'guitar'}:
+        return 'Acoustic'
+    
+    # Mood/Theme
+    if genre_lower in {'party', 'happy', 'sad', 'romance'}:
+        return 'Mood & Theme'
+    
+    # Children
+    if genre_lower in {'children', 'kids', 'disney', 'show-tunes'}:
+        return 'Children'
+    
+    # Comedy
+    if genre_lower == 'comedy':
+        return 'Comedy'
+    
+    # Industrial & Goth
+    if genre_lower in {'industrial', 'goth'}:
+        return 'Industrial & Goth'
+    
+    # Grunge
+    if genre_lower == 'grunge':
+        return 'Grunge'
+    
+    # Trip-Hop
+    if genre_lower == 'trip-hop':
+        return 'Trip-Hop'
+    
+    # Afrobeat
+    if genre_lower == 'afrobeat':
+        return 'Afrobeat'
+    
+    # Default: Other
+    return 'Other'
 
 
 def model_path_for(csv_path: Path) -> Path:
@@ -327,7 +449,7 @@ def progress_path_for(csv_path: Path) -> Path:
 
 def load_progress(progress_path: Path) -> Dict:
     if not progress_path.exists():
-        return {"decisions": {}, "active_subset": None, "batch_count": 0}
+        return {"decisions": {}, "active_subset": None, "batch_count": 0, "excluded_categories": []}
     with progress_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
     if "decisions" not in data:
@@ -336,16 +458,24 @@ def load_progress(progress_path: Path) -> Dict:
         data["active_subset"] = None
     if "batch_count" not in data:
         data["batch_count"] = 0
+    # Support both old format (excluded_genres) and new format (excluded_categories)
+    if "excluded_categories" not in data:
+        if "excluded_genres" in data:
+            # Convert old format: get categories from genres
+            data["excluded_categories"] = []
+        else:
+            data["excluded_categories"] = []
     return data
 
 
-def save_progress(progress_path: Path, decisions: Dict[str, str], active_subset: Optional[List[int]] = None, batch_count: int = 0) -> None:
+def save_progress(progress_path: Path, decisions: Dict[str, str], active_subset: Optional[List[int]] = None, batch_count: int = 0, excluded_categories: Optional[List[str]] = None) -> None:
     tmp = progress_path.with_suffix(progress_path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump({
             "decisions": decisions,
             "active_subset": active_subset,
-            "batch_count": batch_count
+            "batch_count": batch_count,
+            "excluded_categories": excluded_categories or []
         }, f, indent=2)
     os.replace(tmp, progress_path)
 
@@ -398,8 +528,58 @@ def print_song(i: int, total: int, row: SongRow, rating: Optional[str], predicti
     if prediction:
         pred_rating, conf = prediction
         conf_pct = int(conf * 100)
-        print(f"🤖 Predicted rating: {pred_rating}/4 (confidence: {conf_pct}%)")
+        print(f"Predicted rating: {pred_rating}/4 (confidence: {conf_pct}%)")
     print("-" * 70)
+
+
+def weighted_sample_songs(rows: List[SongRow], indices: List[int], sample_size: int) -> List[int]:
+    """Sample songs with weights based on popularity and danceability (without replacement)."""
+    import random
+    
+    if len(indices) <= sample_size:
+        return list(indices)
+    
+    # Calculate weights for each song
+    weights = []
+    for idx in indices:
+        row = rows[idx]
+        # Popularity is 0-100, normalize to 0-1
+        popularity_score = (row.popularity / 100.0) if row.popularity is not None else 0.5
+        # Danceability is already 0-1
+        danceability_score = row.danceability if row.danceability is not None else 0.5
+        
+        # Combined score (equal weight to both)
+        combined_score = (popularity_score + danceability_score) / 2.0
+        
+        # Add a base weight to ensure all songs have some chance
+        weight = combined_score + 0.1
+        weights.append(weight)
+    
+    # Sample without replacement using weighted probabilities
+    selected = []
+    remaining_indices = list(indices)
+    remaining_weights = list(weights)
+    
+    for _ in range(sample_size):
+        if not remaining_indices:
+            break
+        
+        # Normalize remaining weights
+        total_weight = sum(remaining_weights)
+        if total_weight == 0:
+            # Fallback to uniform for remaining
+            selected.extend(random.sample(remaining_indices, min(sample_size - len(selected), len(remaining_indices))))
+            break
+        
+        # Select one based on weighted probability
+        chosen_idx = random.choices(range(len(remaining_indices)), weights=remaining_weights, k=1)[0]
+        selected.append(remaining_indices[chosen_idx])
+        
+        # Remove selected item
+        remaining_indices.pop(chosen_idx)
+        remaining_weights.pop(chosen_idx)
+    
+    return selected
 
 
 def normalize_choice(raw: str) -> Tuple[str, Optional[int]]:
@@ -442,15 +622,68 @@ def main() -> None:
     decisions: Dict[str, str] = dict(prog.get("decisions", {}))
     active_subset: List[int] = prog.get("active_subset")
     batch_count = int(prog.get("batch_count", 0))
+    excluded_categories: List[str] = prog.get("excluded_categories", [])
     
-    # Initialize active subset to all songs if starting fresh
+    # Genre selection step (only if starting fresh)
     if active_subset is None:
-        active_subset = list(range(total))
-        print(f"\nStarting with all {total} songs.")
+        # Group genres into categories
+        genre_to_category = {}
+        category_to_genres = {}
+        for row in rows:
+            if row.category:
+                category = get_genre_category(row.category)
+                genre_to_category[row.category] = category
+                if category not in category_to_genres:
+                    category_to_genres[category] = set()
+                category_to_genres[category].add(row.category)
+        
+        # Count songs per category
+        category_counts = {}
+        for i, row in enumerate(rows):
+            if row.category:
+                category = genre_to_category[row.category]
+                category_counts[category] = category_counts.get(category, 0) + 1
+        
+        # Sort categories by name
+        all_categories = sorted(category_counts.keys())
+        
+        print(f"\n{'='*70}")
+        print("GENRE CATEGORY SELECTION")
+        print(f"{'='*70}")
+        print(f"\nFound {len(all_categories)} genre categories in the dataset.")
+        print("You can exclude entire categories you don't want to review.")
+        print("\nCategories:")
+        for i, category in enumerate(all_categories, 1):
+            count = category_counts[category]
+            num_genres = len(category_to_genres[category])
+            print(f"  {i}. {category} ({count} songs, {num_genres} genres)")
+        
+        print("\nEnter category numbers to EXCLUDE (comma-separated, e.g., '1,3,5')")
+        print("Or press Enter to include all categories:")
+        exclude_input = input("> ").strip()
+        
+        excluded_categories = []
+        if exclude_input:
+            try:
+                exclude_indices = [int(x.strip()) - 1 for x in exclude_input.split(",")]
+                excluded_categories = [all_categories[i] for i in exclude_indices if 0 <= i < len(all_categories)]
+                print(f"\nExcluding {len(excluded_categories)} categories: {', '.join(excluded_categories)}")
+            except ValueError:
+                print("Invalid input. Including all categories.")
+                excluded_categories = []
+        
+        # Filter active subset to exclude selected categories
+        # Include songs with no category in "Other" category
+        active_subset = [i for i, row in enumerate(rows) 
+                        if (row.category and get_genre_category(row.category) not in excluded_categories) 
+                        or (not row.category and "Other" not in excluded_categories)]
+        print(f"\nStarting with {len(active_subset)} songs (after category filtering).")
     else:
         rating4_count = sum(1 for v in decisions.values() if v == "4")
         print(f"\nResuming with {len(active_subset)} songs in active subset.")
         print(f"Batch {batch_count} completed. {rating4_count} songs rated 4 so far.")
+        if excluded_categories:
+            print(f"Excluded categories: {', '.join(excluded_categories)}")
 
     if not ML_AVAILABLE:
         raise RuntimeError("ML features required. Install scikit-learn: pip install scikit-learn numpy")
@@ -461,19 +694,19 @@ def main() -> None:
     
     print(CHOICES_HELP)
     print("\n" + "="*70)
-    print("WORKFLOW: Review 20 songs per batch, then ML narrows to top 50%")
+    print("WORKFLOW: Review 15 songs per batch, then ML narrows to top 50%")
     print("Goal: Find 60 songs you rate 4 (love it)!")
     print("="*70 + "\n")
 
     TARGET_RATING4 = 60
-    SONGS_PER_BATCH = 20
+    SONGS_PER_BATCH = 15
     MIN_SUBSET_SIZE = 200
 
     while True:
         # Check if we've reached the target
         rating4_count = sum(1 for v in decisions.values() if v == "4")
         if rating4_count >= TARGET_RATING4:
-            print(f"\n🎉 Congratulations! You've rated {rating4_count} songs as 4 (love it)!")
+            print(f"\nCongratulations! You've rated {rating4_count} songs as 4 (love it)!")
             break
 
         # Get unreviewed songs from active subset
@@ -488,9 +721,9 @@ def main() -> None:
             # Could expand here, but for now just finish
             break
 
-        # Sample up to SONGS_PER_BATCH unreviewed songs
+        # Sample up to SONGS_PER_BATCH unreviewed songs (weighted by popularity and danceability)
         batch_size = min(SONGS_PER_BATCH, len(unreviewed))
-        batch_indices = random.sample(unreviewed, batch_size)
+        batch_indices = weighted_sample_songs(rows, unreviewed, batch_size)
         
         print(f"\n{'='*70}")
         print(f"BATCH {batch_count + 1}: Reviewing {batch_size} songs")
@@ -503,18 +736,7 @@ def main() -> None:
             current = rows[song_idx]
             current_rating = decisions.get(str(song_idx))
             
-            # Train/retrain model if we have enough decisions
-            num_decisions = sum(1 for v in decisions.values() if v in {"1", "2", "3", "4"})
-            if num_decisions >= 15:
-                model_data = train_model(rows, decisions, min_samples=15)
-                if model_data:
-                    try:
-                        with model_path.open("wb") as f:
-                            pickle.dump(model_data, f)
-                    except Exception:
-                        pass
-            
-            # Get ML prediction
+            # Get ML prediction (model will be retrained after batch if needed)
             prediction: Optional[Tuple[int, float]] = None
             if model_data:
                 prediction = predict_song(model_data, current)
@@ -534,7 +756,7 @@ def main() -> None:
                     decisions[str(song_idx)] = str(num)
                     break
                 elif action == "quit":
-                    save_progress(prog_path, decisions, active_subset, batch_count)
+                    save_progress(prog_path, decisions, active_subset, batch_count, excluded_categories)
                     print(f"\nSaved progress to: {prog_path}")
                     rating4_path, rating3_path, rating2_path, rating1_path = export_lists(csv_path, rows, decisions)
                     print("Exported:")
@@ -547,7 +769,7 @@ def main() -> None:
                     print("Invalid input. Enter 1-4 to rate, or '?' for help.")
 
             # Save progress after each decision
-            save_progress(prog_path, decisions, active_subset, batch_count)
+            save_progress(prog_path, decisions, active_subset, batch_count, excluded_categories)
 
         batch_count += 1
 
@@ -575,12 +797,12 @@ def main() -> None:
                 print(f"{'='*70}\n")
                 
                 # Save updated subset
-                save_progress(prog_path, decisions, active_subset, batch_count)
+                save_progress(prog_path, decisions, active_subset, batch_count, excluded_categories)
         else:
             print(f"\n(Need {15 - num_decisions} more ratings before ML filtering starts)")
 
     # Final export
-    save_progress(prog_path, decisions, active_subset, batch_count)
+    save_progress(prog_path, decisions, active_subset, batch_count, excluded_categories)
     rating4_path, rating3_path, rating2_path, rating1_path = export_lists(csv_path, rows, decisions)
 
     rating4_count = sum(1 for v in decisions.values() if v == "4")
